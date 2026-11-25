@@ -332,6 +332,69 @@ impl Bools {
         found
     }
 
+    /// Read-only check that `c` depends only on wave-uniform atoms.
+    fn is_uniform_ro(&self, c: Bool, memo: &mut Map<Bool, bool>) -> bool {
+        let (v, c0, c1) = self.nodes[c.0 as usize];
+        if v == TERMINAL {
+            return true;
+        }
+        if !matches!(self.atoms[v as usize], Atom::Uniform(_)) {
+            return false;
+        }
+        if let Some(&r) = memo.get(&c) {
+            return r;
+        }
+        let r = self.is_uniform_ro(c0, memo) && self.is_uniform_ro(c1, memo);
+        memo.insert(c, r);
+        r
+    }
+
+    /// Read-only `a => b` over existing BDD nodes (allocates no nodes).
+    fn implies_ro(&self, a: Bool, b: Bool, memo: &mut Map<(Bool, Bool), bool>) -> bool {
+        if a == Bool::FALSE || b == Bool::TRUE || a == b {
+            return true;
+        }
+        if a == Bool::TRUE || b == Bool::FALSE {
+            return false;
+        }
+        if let Some(&r) = memo.get(&(a, b)) {
+            return r;
+        }
+        let (va, a0, a1) = self.nodes[a.0 as usize];
+        let (vb, b0, b1) = self.nodes[b.0 as usize];
+        let v = va.min(vb);
+        let (a0, a1) = if va == v { (a0, a1) } else { (a, a) };
+        let (b0, b1) = if vb == v { (b0, b1) } else { (b, b) };
+        let r = self.implies_ro(a0, b0, memo) && self.implies_ro(a1, b1, memo);
+        memo.insert((a, b), r);
+        r
+    }
+
+    /// Read-only check that every lane satisfying `a` also satisfies `c` on
+    /// every wave-uniform branch where `c` is satisfiable (allocates no nodes).
+    fn confined_ro(&self, a: Bool, c: Bool, memo: &mut Map<(Bool, Bool), bool>) -> bool {
+        if a == Bool::FALSE || c == Bool::TRUE || a == c {
+            return true;
+        }
+        if c == Bool::FALSE {
+            return false;
+        }
+        if let Some(&r) = memo.get(&(a, c)) {
+            return r;
+        }
+        let (va, a0, a1) = self.nodes[a.0 as usize];
+        let (vc, c0, c1) = self.nodes[c.0 as usize];
+        let v = va.min(vc);
+        let (a0, a1) = if va == v { (a0, a1) } else { (a, a) };
+        let (c0, c1) = if vc == v { (c0, c1) } else { (c, c) };
+        let uniform = matches!(self.atoms[v as usize], Atom::Uniform(_));
+        let lo_ok = (uniform && c0 == Bool::FALSE) || self.confined_ro(a0, c0, memo);
+        let hi_ok = (uniform && c1 == Bool::FALSE) || self.confined_ro(a1, c1, memo);
+        let r = lo_ok && hi_ok;
+        memo.insert((a, c), r);
+        r
+    }
+
     fn implies(&mut self, a: Bool, b: Bool) -> bool {
         let nb = self.not(b);
         self.and(a, nb) == Bool::FALSE
@@ -838,6 +901,7 @@ impl<'a> Lanes<'a> {
         }
         self.masks.retain(|k, _| !split.contains(&k.0));
         self.active.retain(|lo| !split.contains(lo));
+        self.filter_active(cond, execs);
         Ok(Structured {
             masks: self.masks.iter().map(|(&(lo, _), &m)| (lo, m)).collect(),
             highs: self
@@ -1398,6 +1462,437 @@ impl<'a> Lanes<'a> {
             reason: "lane conditions do not settle",
         })
     }
+
+    /// Drops masks from `self.active` that were written after `EXEC` was
+    /// widened or replaced beyond the block's reachability `cond[b]` (or by a
+    /// complementing scalar mask op where a join simplified `EXEC` to `TRUE`
+    /// in a divergent block).
+    ///
+    /// Uses only read-only memoized BDD checks on existing nodes so it
+    /// allocates no BDD nodes and cannot trip `Bools::overflow`.
+    fn filter_active(&mut self, cond: &[Bool], execs: &[Vec<Option<Bool>>]) {
+        if self.active.is_empty() {
+            return;
+        }
+        let mut active = std::mem::take(&mut self.active);
+        let p = self.p;
+        let wave64 = p.wave64;
+        let width = if wave64 { "_b64" } else { "_b32" };
+        let key_of = |inst: &Inst, write: bool, code: u8| -> Option<Key> {
+            let f = |r| if write { inst.write(r) } else { inst.read(r) };
+            let lo = f(Reg::S(code))?;
+            let hi = if wave64 { f(Reg::S(code + 1))? } else { lo };
+            Some((lo, hi))
+        };
+        let is_exec = |op: Option<&Operand>| {
+            matches!(op, Some(&Operand::Scalar { code, .. }) if code == EXEC)
+        };
+        let mut uniform_memo: Map<Bool, bool> = Map::default();
+        let mut implies_memo: Map<(Bool, Bool), bool> = Map::default();
+        let true_masks: HashSet<Value> = self
+            .masks
+            .iter()
+            .filter_map(|(&(lo, _), &m)| (m == Bool::TRUE).then_some(lo))
+            .collect();
+        let mut check = ActiveCheck::new(self, cond, width);
+
+        for &block in &self.order {
+            let c = cond[block];
+            if c == Bool::TRUE || c == Bool::FALSE {
+                continue;
+            }
+            let insts = &p.blocks[block].insts;
+            let has_exec_write = insts.iter().any(|i| i.write(Reg::S(EXEC)).is_some());
+            let has_true_exec_phi = p.blocks[block]
+                .phis
+                .iter()
+                .any(|phi| phi.reg == Reg::S(EXEC) && true_masks.contains(&phi.value));
+            if !has_exec_write && !has_true_exec_phi {
+                continue;
+            }
+            if self.b.is_uniform_ro(c, &mut uniform_memo) {
+                // Purely uniform reachability: all lanes enter `block` together.
+                continue;
+            }
+            check.enter_block(block, c);
+
+            let mut widened = false;
+            let mut now: Option<Bool> = None;
+            for (i, inst) in insts.iter().enumerate() {
+                if let Some(e) = execs[block][i] {
+                    now = Some(e);
+                }
+                let name = inst.name();
+                match &inst.fields {
+                    Fields::Sop { dst, src, .. } => {
+                        let op = name.strip_prefix("s_").and_then(|s| s.strip_suffix(width));
+                        let was_widened = widened;
+                        let prev_now = now;
+                        if let Some(eo) = key_of(inst, true, EXEC) {
+                            let m = self.masks.get(&eo).copied().unwrap_or(Bool::TRUE);
+                            let is_wqm = op == Some("wqm");
+                            // A subset of the current EXEC can never activate
+                            // lanes that were not already active here (even if
+                            // `join` simplified the loop's EXEC phi to `TRUE`).
+                            let syntactic_narrow = matches!(
+                                op,
+                                Some(
+                                    "and_saveexec"
+                                        | "andn1_saveexec"
+                                        | "and_wrexec"
+                                        | "andn1_wrexec"
+                                )
+                            ) || (op == Some("and")
+                                && (is_exec(src.first()) || is_exec(src.get(1))))
+                                || (op == Some("andn2") && is_exec(src.first()))
+                                || (op == Some("andn1") && is_exec(src.get(1)))
+                                || (op == Some("mov") && is_exec(src.first()));
+                            let narrows = !was_widened
+                                && (syntactic_narrow
+                                    || execs[block][i].is_some_and(|e| {
+                                        e != Bool::TRUE
+                                            && self.b.implies_ro(m, e, &mut implies_memo)
+                                    }));
+                            let same_scope_restore = match op {
+                                Some("mov") => check.op_confined(inst, src, 0, &active),
+                                Some("and") => {
+                                    check.op_confined(inst, src, 0, &active)
+                                        || check.op_confined(inst, src, 1, &active)
+                                }
+                                Some("andn2" | "andn2_saveexec" | "andn2_wrexec") => {
+                                    check.op_confined(inst, src, 0, &active)
+                                }
+                                Some("andn1") => check.op_confined(inst, src, 1, &active),
+                                Some("or" | "xor" | "cselect") => {
+                                    check.op_confined(inst, src, 0, &active)
+                                        && check.op_confined(inst, src, 1, &active)
+                                }
+                                Some("or_saveexec" | "xor_saveexec" | "or_wrexec" | "xor_wrexec") => {
+                                    !was_widened && check.op_confined(inst, src, 0, &active)
+                                }
+                                _ => false,
+                            };
+                            if is_wqm
+                                || narrows
+                                || same_scope_restore
+                                || check.confined(m, c)
+                            {
+                                widened = false;
+                            } else {
+                                widened = true;
+                                active.remove(&eo.0);
+                            }
+                            now = Some(m);
+                        }
+                        if let Some(Operand::Scalar { code, .. }) = *dst
+                            && code != NULL
+                            && code != EXEC
+                            && let Some(dk) = key_of(inst, true, code)
+                        {
+                            let m = self.masks.get(&dk).copied().unwrap_or(Bool::TRUE);
+                            // `*_saveexec` saves the *previous* EXEC into `dst`
+                            // before modifying EXEC.
+                            let saves_old = op.is_some_and(|o| o.ends_with("_saveexec"));
+                            let dst_widened = if saves_old { was_widened } else { widened };
+                            let complement = matches!(
+                                op,
+                                Some("not" | "nand" | "nor" | "orn2" | "orn1" | "xnor")
+                            );
+                            if (dst_widened || (complement && prev_now == Some(Bool::TRUE)))
+                                && !check.confined(m, c)
+                            {
+                                active.remove(&dk.0);
+                            }
+                        }
+                    }
+                    Fields::Valu(v) => {
+                        if name.starts_with("v_cmpx") {
+                            if let Some(eo) = key_of(inst, true, EXEC) {
+                                let m = self.masks.get(&eo).copied().unwrap_or(Bool::TRUE);
+                                if widened && !check.confined(m, c) {
+                                    active.remove(&eo.0);
+                                } else {
+                                    widened = false;
+                                }
+                                now = Some(m);
+                            }
+                        } else if widened {
+                            let compare = v.dst.filter(|_| name.starts_with("v_cmp"));
+                            for op in compare.iter().chain(&v.carry) {
+                                if let Operand::Scalar { code, .. } = *op
+                                    && let Some(k) = key_of(inst, true, code)
+                                {
+                                    let m = self.masks.get(&k).copied().unwrap_or(Bool::TRUE);
+                                    if !check.confined(m, c) {
+                                        active.remove(&k.0);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        self.active = active;
+    }
+}
+
+/// Memoized read-only helper for [`Lanes::filter_active`], proving whether a
+/// scalar value can only hold lanes reaching the current divergent block.
+struct ActiveCheck<'a, 'b> {
+    lanes: &'a Lanes<'b>,
+    cond: &'a [Bool],
+    val_mask: Map<Value, Bool>,
+    width: &'static str,
+    confined_memo: Map<(Bool, Bool), bool>,
+    postdom_memo: Map<(usize, usize), bool>,
+    mark: Vec<u32>,
+    epoch: u32,
+    work: Vec<usize>,
+    block: usize,
+    c: Bool,
+    val_memo: Map<Value, bool>,
+    visiting: Vec<Value>,
+}
+
+impl<'a, 'b> ActiveCheck<'a, 'b> {
+    fn new(lanes: &'a Lanes<'b>, cond: &'a [Bool], width: &'static str) -> Self {
+        let mut val_mask: Map<Value, Bool> = Map::default();
+        for (&(lo, _), &m) in lanes.other.iter().chain(&lanes.masks) {
+            val_mask.insert(lo, m);
+        }
+        Self {
+            lanes,
+            cond,
+            val_mask,
+            width,
+            confined_memo: Map::default(),
+            postdom_memo: Map::default(),
+            mark: vec![0; lanes.p.blocks.len()],
+            epoch: 0,
+            work: Vec::new(),
+            block: 0,
+            c: Bool::TRUE,
+            val_memo: Map::default(),
+            visiting: Vec::new(),
+        }
+    }
+
+    fn enter_block(&mut self, block: usize, c: Bool) {
+        self.block = block;
+        self.c = c;
+        self.val_memo.clear();
+        self.visiting.clear();
+    }
+
+    fn confined(&mut self, a: Bool, c: Bool) -> bool {
+        self.lanes.b.confined_ro(a, c, &mut self.confined_memo)
+    }
+
+    /// Whether every path from `from` that stays within the current iteration
+    /// of `from` (neither exiting nor taking a back edge to `from` or an
+    /// ancestor) passes through `through`. Every lane active in `from` then
+    /// reconverges at `through`, even when an inner loop leaves an
+    /// unsimplified exit-phi atom in `cond[through]`.
+    fn postdominates(&mut self, through: usize, from: usize) -> bool {
+        if from == through {
+            return true;
+        }
+        if let Some(&r) = self.postdom_memo.get(&(through, from)) {
+            return r;
+        }
+        let from_idx = self.lanes.index[from];
+        self.epoch += 1;
+        let epoch = self.epoch;
+        self.mark[through] = epoch;
+        self.mark[from] = epoch;
+        self.work.clear();
+        self.work.push(from);
+        let mut ok = true;
+        while let Some(u) = self.work.pop() {
+            match self.lanes.p.blocks[u].exit {
+                Exit::End | Exit::Indirect => {
+                    ok = false;
+                    break;
+                }
+                _ => {
+                    for succ in self.lanes.p.blocks[u].exit.successors() {
+                        if succ != through && self.lanes.index[succ] <= from_idx {
+                            ok = false;
+                            break;
+                        }
+                        if self.mark[succ] != epoch {
+                            self.mark[succ] = epoch;
+                            self.work.push(succ);
+                        }
+                    }
+                    if !ok {
+                        break;
+                    }
+                }
+            }
+        }
+        self.postdom_memo.insert((through, from), ok);
+        ok
+    }
+
+    fn op_confined(
+        &mut self,
+        inst: &Inst,
+        src: &[Operand],
+        k: usize,
+        active: &HashSet<Value>,
+    ) -> bool {
+        let mut hit_cycle = false;
+        self.op_confined_in(inst, src, k, active, &mut hit_cycle)
+    }
+
+    fn op_confined_in(
+        &mut self,
+        inst: &Inst,
+        src: &[Operand],
+        k: usize,
+        active: &HashSet<Value>,
+        hit_cycle: &mut bool,
+    ) -> bool {
+        match src.get(k) {
+            Some(&Operand::Scalar { code: NULL, .. })
+            | Some(&Operand::Const(128))
+            | Some(&Operand::Literal(0)) => true,
+            Some(&Operand::Scalar { code, .. }) => inst
+                .read(Reg::S(code))
+                .is_some_and(|v| self.val_confined(v, active, hit_cycle)),
+            _ => false,
+        }
+    }
+
+    /// Whether scalar value `v` (following non-complementing SOPs, VALU
+    /// compares, and phis) only holds lanes reaching `self.block`.
+    fn val_confined(
+        &mut self,
+        v: Value,
+        active: &HashSet<Value>,
+        hit_cycle: &mut bool,
+    ) -> bool {
+        if let Some(&r) = self.val_memo.get(&v) {
+            return r;
+        }
+        if self.visiting.contains(&v) {
+            *hit_cycle = true;
+            return true;
+        }
+        if self.visiting.len() >= 64 {
+            *hit_cycle = true;
+            return false;
+        }
+        self.visiting.push(v);
+        let outer_cycle = *hit_cycle;
+        *hit_cycle = false;
+        let r = self.val_confined_body(v, active, hit_cycle);
+        let cycled = *hit_cycle;
+        *hit_cycle |= outer_cycle;
+        self.visiting.pop();
+        if !cycled {
+            self.val_memo.insert(v, r);
+        }
+        r
+    }
+
+    fn val_confined_body(
+        &mut self,
+        v: Value,
+        active: &HashSet<Value>,
+        hit_cycle: &mut bool,
+    ) -> bool {
+        if let Some(&vm) = self.val_mask.get(&v)
+            && vm != Bool::TRUE
+            && self.confined(vm, self.c)
+        {
+            return true;
+        }
+        let db = match (self.lanes.defs.get(&v), self.lanes.phis.get(&v)) {
+            (Some(&(blk, _)), _) | (_, Some(&(blk, _))) => Some(blk),
+            _ => None,
+        };
+        if active.contains(&v)
+            && db.is_some_and(|blk| {
+                self.confined(self.cond[blk], self.c) || self.postdominates(self.block, blk)
+            })
+        {
+            return true;
+        }
+        if let Some(&(pb, pi)) = self.lanes.phis.get(&v) {
+            let args = &self.lanes.p.blocks[pb].phis[pi].args;
+            return !args.is_empty()
+                && args
+                    .iter()
+                    .all(|&a| self.val_confined(a, active, hit_cycle));
+        }
+        let Some(&(blk, idx)) = self.lanes.defs.get(&v) else {
+            return false;
+        };
+        let def = &self.lanes.p.blocks[blk].insts[idx];
+        match &def.fields {
+            Fields::Sop { src, .. } => {
+                let Some(dop) = def
+                    .name()
+                    .strip_prefix("s_")
+                    .and_then(|n| n.strip_suffix(self.width))
+                else {
+                    return false;
+                };
+                if let Some(f) = dop
+                    .strip_suffix("_saveexec")
+                    .or_else(|| dop.strip_suffix("_wrexec"))
+                {
+                    let is_exec_out = def.write(Reg::S(EXEC)) == Some(v);
+                    if dop.ends_with("_saveexec") && !is_exec_out {
+                        return def
+                            .read(Reg::S(EXEC))
+                            .is_some_and(|ev| self.val_confined(ev, active, hit_cycle));
+                    }
+                    return match f {
+                        "and" => {
+                            self.op_confined_in(def, src, 0, active, hit_cycle)
+                                || def
+                                    .read(Reg::S(EXEC))
+                                    .is_some_and(|ev| self.val_confined(ev, active, hit_cycle))
+                        }
+                        "andn1" => def
+                            .read(Reg::S(EXEC))
+                            .is_some_and(|ev| self.val_confined(ev, active, hit_cycle)),
+                        "andn2" => self.op_confined_in(def, src, 0, active, hit_cycle),
+                        "or" | "xor" => {
+                            self.op_confined_in(def, src, 0, active, hit_cycle)
+                                && def
+                                    .read(Reg::S(EXEC))
+                                    .is_some_and(|ev| self.val_confined(ev, active, hit_cycle))
+                        }
+                        _ => false,
+                    };
+                }
+                match dop {
+                    "mov" => self.op_confined_in(def, src, 0, active, hit_cycle),
+                    "and" => {
+                        self.op_confined_in(def, src, 0, active, hit_cycle)
+                            || self.op_confined_in(def, src, 1, active, hit_cycle)
+                    }
+                    "andn2" => self.op_confined_in(def, src, 0, active, hit_cycle),
+                    "andn1" => self.op_confined_in(def, src, 1, active, hit_cycle),
+                    "or" | "xor" | "cselect" => {
+                        self.op_confined_in(def, src, 0, active, hit_cycle)
+                            && self.op_confined_in(def, src, 1, active, hit_cycle)
+                    }
+                    _ => false,
+                }
+            }
+            Fields::Valu(_) => def
+                .read(Reg::S(EXEC))
+                .is_some_and(|ev| self.val_confined(ev, active, hit_cycle)),
+            _ => false,
+        }
+    }
 }
 
 const TOO_LARGE: ShaderError = ShaderError::Isa {
@@ -1660,6 +2155,150 @@ mod tests {
         };
         assert!(matches!(s.bools.support(when)[..], [Atom::Uniform(_)]));
         assert_eq!(guarded(&s), 0);
+    }
+
+    #[test]
+    fn widened_exec_and_masks_in_divergent_block_are_not_active() {
+        // Inside Block 1 (`cond[1] == (v0 < 16)`):
+        // - `s_or_b32 exec_lo, exec_lo, s0` widens EXEC to all lanes
+        // - `v_cmp_eq_u32 vcc_lo, 0, v0` runs under that widened EXEC
+        // Neither may be in `active`. Reconvergence (`Block 2`) restores EXEC
+        // where every lane enters, so that write stays active.
+        let p = build(
+            &[
+                0x7D88_0090, // 0,0: v_cmp_gt_u32 vcc_lo, 16, v0
+                0xBE80_3C6A, // 0,1: s_and_saveexec_b32 s0, vcc_lo
+                0xBF88_0002, // 0,2: s_cbranch_execz -> Block 2
+                0x887E_007E, // 1,0: s_or_b32 exec_lo, exec_lo, s0
+                0x7D84_0080, // 1,1: v_cmp_eq_u32 vcc_lo, 0, v0
+                0x887E_007E, // 2,0: s_or_b32 exec_lo, exec_lo, s0 (reconverged)
+                S_ENDPGM,
+            ],
+            false,
+        );
+        let s = structure(&p).unwrap();
+        let entry_vcc = p.blocks[0].insts[0].write(Reg::S(VCC)).unwrap();
+        let narrowed_exec = p.blocks[0].insts[1].write(Reg::S(EXEC)).unwrap();
+        let widened_or = p.blocks[1].insts[0].write(Reg::S(EXEC)).unwrap();
+        let cmp_under_widened = p.blocks[1].insts[1].write(Reg::S(VCC)).unwrap();
+        let reconv_or = p.blocks[2].insts[0].write(Reg::S(EXEC)).unwrap();
+
+        assert!(s.active.contains(&entry_vcc));
+        assert!(s.active.contains(&narrowed_exec));
+        assert!(!s.active.contains(&widened_or));
+        assert!(!s.active.contains(&cmp_under_widened));
+        assert!(s.active.contains(&reconv_or));
+
+        // Same with `s_xor_b32 exec_lo, exec_lo, s0` (flips EXEC to lanes
+        // 16..31, disjoint from Block 1's lanes 0..15).
+        let p_xor = build(
+            &[
+                0x7D88_0090, // 0,0: v_cmp_gt_u32 vcc_lo, 16, v0
+                0xBE80_3C6A, // 0,1: s_and_saveexec_b32 s0, vcc_lo
+                0xBF88_0002, // 0,2: s_cbranch_execz -> Block 2
+                0x897E_007E, // 1,0: s_xor_b32 exec_lo, exec_lo, s0
+                0x7D84_0080, // 1,1: v_cmp_eq_u32 vcc_lo, 0, v0
+                0x887E_007E, // 2,0: s_or_b32 exec_lo, exec_lo, s0 (reconverged)
+                S_ENDPGM,
+            ],
+            false,
+        );
+        let s_xor = structure(&p_xor).unwrap();
+        let widened_xor = p_xor.blocks[1].insts[0].write(Reg::S(EXEC)).unwrap();
+        let cmp_under_xor = p_xor.blocks[1].insts[1].write(Reg::S(VCC)).unwrap();
+        assert!(!s_xor.active.contains(&widened_xor));
+        assert!(!s_xor.active.contains(&cmp_under_xor));
+    }
+
+    #[test]
+    fn complement_inside_divergent_loop_is_not_active_but_uniform_branch_stays_active() {
+        // Loop inside `if (v0 < 16)`: `join` simplifies the loop's EXEC phi to
+        // `TRUE`, but `s_not_b32 s2, vcc_lo` sets bits for lanes outside the
+        // `if`, so `s2` must not be active while `vcc_lo` stays active.
+        let p = build(
+            &[
+                0x7D88_0090, // 0,0: v_cmp_gt_u32 vcc_lo, 16, v0
+                0xBE80_3C6A, // 0,1: s_and_saveexec_b32 s0, vcc_lo
+                0xBF88_0005, // 0,2: s_cbranch_execz -> exit
+                0xBE81_0380, // 1,0: s_mov_b32 s1, 0
+                0x7D84_0080, // 2,0: v_cmp_eq_u32 vcc_lo, 0, v0
+                0xBE82_046A, // 2,1: s_not_b32 s2, vcc_lo
+                0x8001_8101, // 2,2: s_add_u32 s1, s1, 1
+                0xBF0A_8401, // 2,3: s_cmp_lt_u32 s1, 4
+                0xBF85_FFFB, // 2,4: s_cbranch_scc1 -> 2,0
+                0x887E_007E, // 3,0: s_or_b32 exec_lo, exec_lo, s0
+                S_ENDPGM,
+            ],
+            false,
+        );
+        let s = structure(&p).unwrap();
+        let loop_vcc = p.blocks[2].insts[0].write(Reg::S(VCC)).unwrap();
+        let loop_not = p.blocks[2].insts[1].write(Reg::S(2)).unwrap();
+        assert!(s.active.contains(&loop_vcc));
+        assert!(!s.active.contains(&loop_not));
+
+        // Uniform branch (`s_cmp_eq_u32` + `s_cbranch_scc0`): every lane of the
+        // wave enters Block 1 together, so a `v_cmp` there remains active.
+        let uniform = build(
+            &[
+                0xBF06_8000, // 0,0: s_cmp_eq_u32 s0, 0
+                0xBF84_0001, // 0,1: s_cbranch_scc0 -> exit
+                0x7D84_0080, // 1,0: v_cmp_eq_u32 vcc_lo, 0, v0
+                S_ENDPGM,
+            ],
+            false,
+        );
+        let su = structure(&uniform).unwrap();
+        let u_vcc = uniform.blocks[1].insts[0].write(Reg::S(VCC)).unwrap();
+        assert!(su.active.contains(&u_vcc));
+    }
+
+    #[test]
+    fn post_loop_reconvergence_exec_restore_stays_active_but_back_edge_escape_does_not() {
+        // Divergent-exit loop inside `if (v0 < 16)`: every lane that entered
+        // Block 0 reconverges at Block 3 even though `cond[3]` keeps the
+        // loop's unsimplified exit atom, so restoring saved `s0` stays active.
+        let p = build(
+            &[
+                0x7D88_0090, // 0,0: v_cmp_gt_u32 vcc_lo, 16, v0
+                0xBE80_3C6A, // 0,1: s_and_saveexec_b32 s0, vcc_lo
+                0xBF88_0006, // 0,2: s_cbranch_execz -> Block 3 (reconv)
+                0xBE81_0380, // 1,0: s_mov_b32 s1, 0
+                0x4A00_0081, // 2,0: v_add_nc_u32 v0, 1, v0
+                0x7D84_0080, // 2,1: v_cmp_eq_u32 vcc_lo, 0, v0
+                0x8801_016A, // 2,2: s_or_b32 s1, vcc_lo, s1
+                0x8A7E_017E, // 2,3: s_andn2_b32 exec_lo, exec_lo, s1
+                0xBF89_FFFB, // 2,4: s_cbranch_execnz -> 2,0
+                0xBEFE_0300, // 3,0: s_mov_b32 exec_lo, s0 (reconverged)
+                S_ENDPGM,
+            ],
+            false,
+        );
+        let s = structure(&p).unwrap();
+        let reconv = p.blocks.len() - 1;
+        assert_ne!(s.reach[reconv], Bool::TRUE);
+        let restored_exec = p.blocks[reconv].insts[0].write(Reg::S(EXEC)).unwrap();
+        assert!(s.active.contains(&restored_exec));
+
+        // By contrast, when skipped lanes take a back edge to Block 1 instead
+        // of reconverging at Block 2, Block 2 does not post-dominate Block 1
+        // within the iteration, so restoring `s0` there widens EXEC past
+        // Block 2's reachability and must not be active.
+        let escaped = build(
+            &[
+                0xBF80_0000, // 0,0: s_nop 0 (preheader; IR forbids branching to 0)
+                0xBE80_037E, // 1,0: s_mov_b32 s0, exec_lo
+                0x7D88_0090, // 1,1: v_cmp_gt_u32 vcc_lo, 16, v0
+                0xBE81_3C6A, // 1,2: s_and_saveexec_b32 s1, vcc_lo
+                0xBF88_FFFC, // 1,3: s_cbranch_execz -> 1,0 (back edge!)
+                0xBEFE_0300, // 2,0: s_mov_b32 exec_lo, s0
+                S_ENDPGM,
+            ],
+            false,
+        );
+        let se = structure(&escaped).unwrap();
+        let escaped_exec = escaped.blocks[2].insts[0].write(Reg::S(EXEC)).unwrap();
+        assert!(!se.active.contains(&escaped_exec));
     }
 
     #[test]

@@ -11233,6 +11233,68 @@ mod tests {
     }
 
     #[test]
+    fn widened_exec_in_divergent_block_is_refused_as_data() {
+        // Inside a divergent `s_cbranch_execz` body (`v0 < 16`), widening EXEC
+        // with `s_or_b32`/`s_xor_b32` or running `v_cmp` under that widened
+        // EXEC produces a mask holding lanes outside the block. Reading it as
+        // data must be refused rather than silently balloting only the lanes
+        // that entered the block.
+        for widen in [
+            0x887E_007E, // s_or_b32 exec_lo, exec_lo, s0
+            0x897E_007E, // s_xor_b32 exec_lo, exec_lo, s0
+        ] {
+            let words = [
+                0x7D88_0090, // v_cmp_gt_u32 vcc_lo, 16, v0
+                0xBE80_3C6A, // s_and_saveexec_b32 s0, vcc_lo
+                0xBF88_0005, // s_cbranch_execz -> end
+                widen,       // widen EXEC past Block 1's reachability
+                0xBE82_0F7E, // s_bcnt1_i32_b32 s2, exec_lo
+                0xBF07_8002, // s_cmp_lg_u32 s2, 0
+                0xBF85_0001, // s_cbranch_scc1 -> end
+                0xBE84_0380, // s_mov_b32 s4, 0
+                S_ENDPGM,
+            ];
+            let Err(crate::ShaderError::Unsupported { what, .. }) = lowers(&words, 0) else {
+                panic!("widened EXEC ({widen:#x}) translated as a partial-wave ballot");
+            };
+            assert_eq!(what, super::MASK_ELSEWHERE);
+        }
+
+        // A `v_cmp` under widened EXEC is likewise refused when read as data.
+        let cmp_under_widened = [
+            0x7D88_0090, // v_cmp_gt_u32 vcc_lo, 16, v0
+            0xBE80_3C6A, // s_and_saveexec_b32 s0, vcc_lo
+            0xBF88_0006, // s_cbranch_execz -> end
+            0x887E_007E, // s_or_b32 exec_lo, exec_lo, s0
+            0x7D84_0080, // v_cmp_eq_u32 vcc_lo, 0, v0
+            0xBE82_0F6A, // s_bcnt1_i32_b32 s2, vcc_lo
+            0xBF07_8002, // s_cmp_lg_u32 s2, 0
+            0xBF85_0001, // s_cbranch_scc1 -> end
+            0xBE84_0380, // s_mov_b32 s4, 0
+            S_ENDPGM,
+        ];
+        let Err(crate::ShaderError::Unsupported { what, .. }) = lowers(&cmp_under_widened, 0)
+        else {
+            panic!("v_cmp under widened EXEC translated as a partial-wave ballot");
+        };
+        assert_eq!(what, super::MASK_ELSEWHERE);
+
+        // Without widening EXEC, reading a divergent-block `v_cmp` stays valid.
+        let narrowed = [
+            0x7D88_0090, // v_cmp_gt_u32 vcc_lo, 16, v0
+            0xBE80_3C6A, // s_and_saveexec_b32 s0, vcc_lo
+            0xBF88_0005, // s_cbranch_execz -> end
+            0x7D84_0080, // v_cmp_eq_u32 vcc_lo, 0, v0
+            0xBE82_0F6A, // s_bcnt1_i32_b32 s2, vcc_lo
+            0xBF07_8002, // s_cmp_lg_u32 s2, 0
+            0xBF85_0001, // s_cbranch_scc1 -> end
+            0xBE84_0380, // s_mov_b32 s4, 0
+            S_ENDPGM,
+        ];
+        lowers(&narrowed, 0).expect("narrowed v_cmp inside divergent block");
+    }
+
+    #[test]
     #[ignore = "ours marks joins read through joins only with VICTORY_STRICT_JOINS (40 programs stop otherwise)"]
     fn a_missing_value_stays_missing_through_two_live_joins() {
         let mut words = [
